@@ -198,53 +198,52 @@ jobs:
       #
       - name: Apply SUSFS patches and copy source files
         run: |
+          set -euo pipefail
           BRANCH="${{ inputs.susfs_branch }}"
           PATCHES="$SUSFS_DIR/kernel_patches"
           KERNEL="$KERNEL_ROOT/common"
           cd "$KERNEL"
 
+          apply_checked_patch() {
+            local patch_file="$1"
+            local label="$2"
+
+            echo ">>> Checking $label patch: $(basename "$patch_file")"
+            if ! git apply --check --whitespace=nowarn "$patch_file"; then
+              echo "ERROR: $label patch does not apply cleanly to this kernel tree."
+              echo "Inspect the patch base, kernel manifest branch, and SUSFS/KernelSU-Next commit alignment."
+              exit 1
+            fi
+
+            echo ">>> Applying $label patch"
+            patch -p1 --forward --batch --no-backup-if-mismatch < "$patch_file"
+          }
+
           # PART A — kernel-side patch
           KPATCH=$(ls "$PATCHES"/50_add_susfs_in_${BRANCH}*.patch 2>/dev/null | head -1)
           if [[ -z "$KPATCH" ]]; then
-            echo "ERROR: no 50_add_susfs_in_${BRANCH}*.patch found"; ls "$PATCHES"/; exit 1
+            echo "ERROR: no 50_add_susfs_in_${BRANCH}*.patch found"
+            ls "$PATCHES"/
+            exit 1
           fi
-          echo ">>> Applying kernel SUSFS patch: $(basename "$KPATCH")"
-          patch -p1 --forward --no-backup-if-mismatch < "$KPATCH" || {
-            echo "WARNING: patch had rejects:"; find . -name "*.rej" | head -20
-          }
+          apply_checked_patch "$KPATCH" "kernel SUSFS"
 
           # PART B — copy new SUSFS source files
           echo ">>> Copying SUSFS source files"
           [[ -f "$PATCHES/fs/susfs.c" ]] || { echo "ERROR: $PATCHES/fs/susfs.c missing"; exit 1; }
           [[ -f "$PATCHES/include/linux/susfs.h" ]] || { echo "ERROR: susfs.h missing"; exit 1; }
           [[ -f "$PATCHES/include/linux/susfs_def.h" ]] || { echo "ERROR: susfs_def.h missing"; exit 1; }
-          cp -v "$PATCHES/fs/susfs.c"            fs/susfs.c
-          cp -v "$PATCHES/include/linux/susfs.h" include/linux/susfs.h
+          cp -v "$PATCHES/fs/susfs.c"              fs/susfs.c
+          cp -v "$PATCHES/include/linux/susfs.h"   include/linux/susfs.h
           cp -v "$PATCHES/include/linux/susfs_def.h" include/linux/susfs_def.h
           grep -q 'susfs\.o' fs/Makefile || echo 'obj-y += susfs.o' >> fs/Makefile
 
-          # PART C — KernelSU-Next enablement patch + API shim
+          # PART C — KernelSU-Next enablement patch
           KSU_PATCH="$PATCHES/KernelSU/10_enable_susfs_for_ksu.patch"
           if [[ -f "$KSU_PATCH" ]]; then
             echo ">>> Applying KernelSU-Next SUSFS enablement patch"
             cd KernelSU-Next
-            patch -p1 --forward --no-backup-if-mismatch < "$KSU_PATCH" || {
-              echo "WARNING: KSU patch had rejects:"; find . -name "*.rej" | head -10
-            }
-            # Shim: rename old ksu_syscall_hook_manager_* API if present
-            if grep -rq 'ksu_syscall_hook_manager_' . --include='*.c' --include='*.h'; then
-              echo ">>> Applying hook_manager → hook rename shim"
-              find . \( -name '*.c' -o -name '*.h' \) -exec sed -i \
-                -e 's/ksu_syscall_hook_manager_init/ksu_syscall_hook_init/g' \
-                -e 's/ksu_syscall_hook_manager_exit/ksu_syscall_hook_exit/g' {} +
-            fi
-            # ksu_late_loaded: inject declaration if patch added calls but not the var
-            if grep -q 'ksu_late_loaded' core/init.c 2>/dev/null; then
-              if ! grep -qE 'bool ksu_late_loaded|ksu_late_loaded;' ksu.h core/init.c 2>/dev/null; then
-                echo ">>> Injecting ksu_late_loaded declaration"
-                sed -i '1s/^/static bool ksu_late_loaded = false;\n/' core/init.c
-              fi
-            fi
+            apply_checked_patch "$KSU_PATCH" "KernelSU-Next SUSFS enablement"
             cd ..
           else
             echo "WARNING: $KSU_PATCH not found — skipping"
@@ -254,8 +253,7 @@ jobs:
           HOOKS="$PATCHES/60_scope-minimized_manual_hooks.patch"
           if [[ -f "$HOOKS" ]]; then
             echo ">>> Applying scope-minimised manual hooks patch"
-            patch -p1 --forward --no-backup-if-mismatch < "$HOOKS" || \
-              echo "WARNING: hooks patch had rejects"
+            apply_checked_patch "$HOOKS" "manual hooks"
           fi
 
       # ── 9. Pre-build sanity check ────────────────────────────────────────────
