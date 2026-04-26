@@ -217,8 +217,10 @@ jobs:
           echo ">>> Copying SUSFS source files"
           [[ -f "$PATCHES/fs/susfs.c" ]] || { echo "ERROR: $PATCHES/fs/susfs.c missing"; exit 1; }
           [[ -f "$PATCHES/include/linux/susfs.h" ]] || { echo "ERROR: susfs.h missing"; exit 1; }
-          cp -v "$PATCHES/fs/susfs.c"           fs/susfs.c
+          [[ -f "$PATCHES/include/linux/susfs_def.h" ]] || { echo "ERROR: susfs_def.h missing"; exit 1; }
+          cp -v "$PATCHES/fs/susfs.c"            fs/susfs.c
           cp -v "$PATCHES/include/linux/susfs.h" include/linux/susfs.h
+          cp -v "$PATCHES/include/linux/susfs_def.h" include/linux/susfs_def.h
           grep -q 'susfs\.o' fs/Makefile || echo 'obj-y += susfs.o' >> fs/Makefile
 
           # PART C — KernelSU-Next enablement patch + API shim
@@ -263,6 +265,7 @@ jobs:
           fail=0
           check() { [[ -f "$1" ]] && echo "PASS: $1" || { echo "FAIL: $1 missing"; fail=1; }; }
           check "$K/include/linux/susfs.h"
+          check "$K/include/linux/susfs_def.h"
           check "$K/fs/susfs.c"
           grep -q 'susfs\.o' "$K/fs/Makefile" \
             && echo "PASS: fs/Makefile has susfs.o" \
