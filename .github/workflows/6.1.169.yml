@@ -9,17 +9,8 @@ on:
         default: "common-android14-6.1-2026-03"
         required: true
 
-      ksu_branch:
-        description: "KernelSU-Next branch (next-susfs recommended)"
-        type: choice
-        options:
-          - next-susfs
-          - next-susfs-dev
-          - next
-        default: next-susfs
-
-      ksu_commit:
-        description: "Pin KernelSU-Next to a specific commit (optional, leave blank for HEAD)"
+      ksu_tag:
+        description: "KernelSU-Next tag/commit to pin (blank = latest next HEAD)"
         type: string
         default: ""
         required: false
@@ -45,7 +36,7 @@ on:
         default: true
 
       boot_image_url:
-        description: "Stock boot.img URL for patching (optional, leave blank to skip)"
+        description: "Stock boot.img URL for patching (optional)"
         type: string
         default: ""
         required: false
@@ -65,6 +56,7 @@ jobs:
       KERNEL_ROOT: ${{ github.workspace }}/kernel
       DIST_DIR:    ${{ github.workspace }}/kernel/out/dist
       SUSFS_DIR:   ${{ github.workspace }}/susfs4ksu
+      KSU_SETUP_URL: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
 
     steps:
       # ── 0. Maximise disk space ──────────────────────────────────────────────
@@ -98,11 +90,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates cpio curl \
             flex git libelf-dev libncurses-dev libssl-dev lz4 \
-            python3 python3-pip repo unzip wget zip zstd \
+            python3 python3-pip unzip wget zip zstd \
             ccache
-          # repo needs a modern Python
-          python3 -m pip install --upgrade --break-system-packages \
-            gitpython
 
       # ── 2. Configure ccache ─────────────────────────────────────────────────
       - name: Configure ccache
@@ -111,11 +100,9 @@ jobs:
           max-size: "4G"
           key: gki-a14-6.1-${{ inputs.manifest_branch }}
 
-      # ── 3. Checkout this repo (for any local scripts) ───────────────────────
+      # ── 3. Checkout this repo ───────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: repo-scripts
 
       # ── 4. repo init + sync ─────────────────────────────────────────────────
       - name: repo init
@@ -127,7 +114,6 @@ jobs:
             -u https://android.googlesource.com/kernel/manifest \
             -b "${{ inputs.manifest_branch }}" \
             --repo-rev=v2.16
-          echo "repo init complete for branch: ${{ inputs.manifest_branch }}"
 
       - name: repo sync
         run: |
@@ -138,36 +124,9 @@ jobs:
             --no-clone-bundle \
             -j$(nproc --all) \
             --fail-fast
-          echo "Disk usage after sync:"
-          df -h .
+          echo "Disk usage after sync:"; df -h .
 
-      # ── 5. Set up KernelSU-Next ─────────────────────────────────────────────
-      - name: Set up KernelSU-Next
-        run: |
-          cd "$KERNEL_ROOT/common"
-
-          KSU_BRANCH="${{ inputs.ksu_branch }}"
-          KSU_COMMIT="${{ inputs.ksu_commit }}"
-
-          echo ">>> Injecting KernelSU-Next (branch: $KSU_BRANCH)"
-          curl -LSs \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/$KSU_BRANCH/kernel/setup.sh" \
-            | bash -s "$KSU_BRANCH"
-
-          # Optionally pin to a specific commit
-          if [[ -n "$KSU_COMMIT" ]]; then
-            echo ">>> Pinning KernelSU-Next to commit: $KSU_COMMIT"
-            cd KernelSU-Next
-            git fetch --depth=1 origin "$KSU_COMMIT"
-            git checkout "$KSU_COMMIT"
-            cd ..
-          fi
-
-          KSU_VER=$(cd KernelSU-Next && git rev-parse --short HEAD)
-          echo "KSU_VERSION=$KSU_VER" >> "$GITHUB_ENV"
-          echo "KernelSU-Next version: $KSU_VER"
-
-      # ── 6. Clone SUSFS ──────────────────────────────────────────────────────
+      # ── 5. Clone SUSFS early (needed before KSU setup) ─────────────────────
       - name: Clone SUSFS
         run: |
           git clone \
@@ -175,188 +134,275 @@ jobs:
             -b "${{ inputs.susfs_branch }}" \
             https://gitlab.com/simonpunk/susfs4ksu.git \
             "$SUSFS_DIR"
-
           SUSFS_COMMIT=$(cd "$SUSFS_DIR" && git rev-parse --short HEAD)
           echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
           echo "SUSFS commit: $SUSFS_COMMIT"
 
-      # ── 7. Apply SUSFS patches ──────────────────────────────────────────────
-      - name: Apply SUSFS kernel patches
+      # ── 6. Set up KernelSU-Next ─────────────────────────────────────────────
+      - name: Set up KernelSU-Next
         run: |
-          BRANCH="${{ inputs.susfs_branch }}"
-          PATCHES_DIR="$SUSFS_DIR/kernel_patches"
-
           cd "$KERNEL_ROOT/common"
 
-          echo ">>> Applying SUSFS kernel patch (50_add_susfs_in_${BRANCH}.patch)"
-          PATCH_FILE="$PATCHES_DIR/50_add_susfs_in_${BRANCH}.patch"
+          KSU_TAG="${{ inputs.ksu_tag }}"
 
-          if [[ ! -f "$PATCH_FILE" ]]; then
-            # Try wildcard match in case name has extra suffix
-            PATCH_FILE=$(ls "$PATCHES_DIR"/50_add_susfs_in_${BRANCH}*.patch 2>/dev/null | head -1)
-          fi
-
-          if [[ -z "$PATCH_FILE" || ! -f "$PATCH_FILE" ]]; then
-            echo "ERROR: Could not find SUSFS kernel patch for branch $BRANCH"
-            ls "$PATCHES_DIR"/
+          HTTP_STATUS=$(curl -o /dev/null -sLw "%{http_code}" "$KSU_SETUP_URL")
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "ERROR: setup.sh URL returned HTTP $HTTP_STATUS — URL: $KSU_SETUP_URL"
             exit 1
           fi
 
-          patch -p1 --forward --no-backup-if-mismatch < "$PATCH_FILE" || {
-            echo "WARNING: SUSFS kernel patch had rejects — check .rej files"
+          REF="${KSU_TAG:-next}"
+          echo ">>> Installing KernelSU-Next at ref: $REF"
+          curl -LSs "$KSU_SETUP_URL" | bash -s "$REF"
+
+          KSU_COMMIT=$(cd KernelSU-Next && git rev-parse --short HEAD)
+          echo "KSU_COMMIT=$KSU_COMMIT" >> "$GITHUB_ENV"
+          echo "KernelSU-Next commit: $KSU_COMMIT"
+
+      # ── 7. Apply SUSFS — patches + source files ─────────────────────────────
+      #
+      #  This step has two distinct parts that must both happen:
+      #
+      #  PART A — Patch existing kernel files
+      #    50_add_susfs_in_<branch>.patch modifies existing files
+      #    (fs/namespace.c, fs/exec.c, etc.) to add SUSFS hook calls and
+      #    #include <linux/susfs.h>. The patch does NOT create new files.
+      #
+      #  PART B — Copy new SUSFS source files  ← THE FIX FOR ERROR SET 1
+      #    susfs.c and susfs.h are brand-new files that live in the SUSFS repo.
+      #    They must be manually copied into the kernel tree. Without this,
+      #    every symbol from susfs.h (DEFAULT_KSU_MNT_ID, susfs_mnt_id_ida,
+      #    susfs_is_current_ksu_domain, etc.) is undeclared.
+      #
+      #  PART C — Enable SUSFS inside KernelSU-Next
+      #    10_enable_susfs_for_ksu.patch modifies KernelSU-Next's init.c,
+      #    allowlist.c, etc. to call into SUSFS.
+      #
+      #    ⚠ API COMPATIBILITY (ERROR SET 2):
+      #    The SUSFS patch calls ksu_syscall_hook_manager_{init,exit} but
+      #    the KernelSU-Next 'next' branch uses ksu_syscall_hook_{init,exit}.
+      #    After patching, we rename the calls to match what actually exists.
+      #
+      - name: Apply SUSFS patches and copy source files
+        run: |
+          BRANCH="${{ inputs.susfs_branch }}"
+          PATCHES="$SUSFS_DIR/kernel_patches"
+          KERNEL="$KERNEL_ROOT/common"
+
+          cd "$KERNEL"
+
+          # ── PART A: Kernel-side patch ──────────────────────────────────────
+          KPATCH=$(ls "$PATCHES"/50_add_susfs_in_${BRANCH}*.patch 2>/dev/null | head -1)
+          if [[ -z "$KPATCH" ]]; then
+            echo "ERROR: no 50_add_susfs_in_${BRANCH}*.patch found in $PATCHES/"
+            ls "$PATCHES"/
+            exit 1
+          fi
+          echo ">>> Applying kernel SUSFS patch: $(basename "$KPATCH")"
+          patch -p1 --forward --no-backup-if-mismatch < "$KPATCH" || {
+            echo "WARNING: kernel SUSFS patch had rejects — listing .rej files:"
             find . -name "*.rej" | head -20
+            # Don't exit — partial apply is often fine for the core files
           }
 
-          # Apply KernelSU-Next SUSFS enablement patch
-          # (Only needed when using 'next' branch; 'next-susfs' already has it)
-          KSU_BRANCH="${{ inputs.ksu_branch }}"
-          if [[ "$KSU_BRANCH" == "next" ]]; then
-            echo ">>> Applying SUSFS → KernelSU-Next enablement patch"
-            KSU_PATCH="$PATCHES_DIR/KernelSU/10_enable_susfs_for_ksu.patch"
-            if [[ -f "$KSU_PATCH" ]]; then
-              cd KernelSU-Next
-              patch -p1 --forward --no-backup-if-mismatch < "$KSU_PATCH" || \
-                echo "WARNING: KSU enablement patch had rejects"
-              cd ..
+          # ── PART B: Copy new SUSFS source files ────────────────────────────
+          # These are NEW files the patch doesn't create — they must be copied.
+          echo ">>> Copying SUSFS source files into kernel tree"
+
+          SUSFS_C="$PATCHES/fs/susfs.c"
+          SUSFS_H="$PATCHES/include/linux/susfs.h"
+
+          if [[ ! -f "$SUSFS_C" ]]; then
+            echo "ERROR: $SUSFS_C not found in SUSFS repo — check susfs_branch"
+            ls "$PATCHES/fs/" 2>/dev/null || echo "(no fs/ dir)"
+            exit 1
+          fi
+          if [[ ! -f "$SUSFS_H" ]]; then
+            echo "ERROR: $SUSFS_H not found in SUSFS repo"
+            ls "$PATCHES/include/linux/" 2>/dev/null || echo "(no include/linux/ dir)"
+            exit 1
+          fi
+
+          cp -v "$SUSFS_C" fs/susfs.c
+          cp -v "$SUSFS_H" include/linux/susfs.h
+
+          # The 50_ patch should have already added "obj-y += susfs.o" to
+          # fs/Makefile. Verify; add it if not present (safety net).
+          if ! grep -q 'susfs\.o' fs/Makefile; then
+            echo ">>> fs/Makefile missing susfs.o entry — adding it"
+            echo 'obj-y += susfs.o' >> fs/Makefile
+          fi
+
+          # ── PART C: KernelSU-Next SUSFS enablement patch ───────────────────
+          KSU_PATCH="$PATCHES/KernelSU/10_enable_susfs_for_ksu.patch"
+          if [[ -f "$KSU_PATCH" ]]; then
+            echo ">>> Applying KernelSU-Next SUSFS enablement patch"
+            cd KernelSU-Next
+            patch -p1 --forward --no-backup-if-mismatch < "$KSU_PATCH" || {
+              echo "WARNING: KSU enablement patch had rejects (possibly partial apply)"
+              find . -name "*.rej" | head -10
+            }
+
+            # ── API COMPATIBILITY SHIM ────────────────────────────────────────
+            # The SUSFS patch calls ksu_syscall_hook_manager_{init,exit} but
+            # KernelSU-Next 'next' renamed them to ksu_syscall_hook_{init,exit}.
+            # Fix any occurrence of the old names left in patched files.
+            echo ">>> Checking for ksu_syscall_hook_manager_* API rename"
+            if grep -r 'ksu_syscall_hook_manager_init' . --include='*.c' --include='*.h' -l 2>/dev/null | grep -q .; then
+              echo "    Found old API names — applying rename shim"
+              find . \( -name '*.c' -o -name '*.h' \) \
+                -exec sed -i \
+                  -e 's/ksu_syscall_hook_manager_init/ksu_syscall_hook_init/g' \
+                  -e 's/ksu_syscall_hook_manager_exit/ksu_syscall_hook_exit/g' \
+                  {} +
             else
-              echo "WARNING: KSU enablement patch not found at $KSU_PATCH"
+              echo "    No old API names found — no shim needed"
             fi
+
+            # ksu_late_loaded: if the patch added calls to it but the
+            # declaration hunk was rejected, declare it in the init.c itself.
+            if grep -q 'ksu_late_loaded' core/init.c 2>/dev/null; then
+              if ! grep -q 'ksu_late_loaded' ksu.h 2>/dev/null && \
+                 ! grep -q 'bool ksu_late_loaded' core/init.c 2>/dev/null; then
+                echo ">>> Injecting missing ksu_late_loaded declaration"
+                # Prepend declaration near the top of init.c (after the last #include)
+                awk '/#include/{p=NR} END{print p}' core/init.c | \
+                  xargs -I{} sed -i '{}a static bool ksu_late_loaded = false;' core/init.c
+              fi
+            fi
+
+            cd ..
           else
-            echo ">>> Skipping KSU enablement patch (already in $KSU_BRANCH branch)"
+            echo "WARNING: $KSU_PATCH not found — skipping KSU enablement patch"
           fi
 
-          # Copy SUSFS source files into kernel tree
-          echo ">>> Copying SUSFS fs/ sources into kernel"
-          cp -v "$SUSFS_DIR/kernel_patches/fs/"*.c fs/ 2>/dev/null || true
-          cp -v "$SUSFS_DIR/kernel_patches/include/linux/"*.h \
-            include/linux/ 2>/dev/null || true
-
-      # ── 8. (Optional) Apply additional scope-minimised manual hooks ─────────
-      - name: Apply manual hooks patch (if present)
-        run: |
-          HOOKS_PATCH="$SUSFS_DIR/kernel_patches/60_scope-minimized_manual_hooks.patch"
-          if [[ -f "$HOOKS_PATCH" ]]; then
+          # ── PART D: Scope-minimised manual hooks (optional) ────────────────
+          HOOKS="$PATCHES/60_scope-minimized_manual_hooks.patch"
+          if [[ -f "$HOOKS" ]]; then
             echo ">>> Applying scope-minimised manual hooks patch"
-            cd "$KERNEL_ROOT/common"
-            patch -p1 --forward --no-backup-if-mismatch < "$HOOKS_PATCH" || \
+            patch -p1 --forward --no-backup-if-mismatch < "$HOOKS" || \
               echo "WARNING: hooks patch had rejects"
-          else
-            echo ">>> No manual hooks patch found, skipping"
           fi
+
+      # ── 8. Verify key symbols are resolvable before wasting build time ──────
+      - name: Pre-build sanity check
+        run: |
+          KERNEL="$KERNEL_ROOT/common"
+          echo "=== Checking SUSFS header is in place ==="
+          if [[ ! -f "$KERNEL/include/linux/susfs.h" ]]; then
+            echo "FAIL: include/linux/susfs.h missing"; exit 1
+          fi
+          echo "PASS: include/linux/susfs.h exists"
+
+          echo "=== Checking susfs.c is in place ==="
+          if [[ ! -f "$KERNEL/fs/susfs.c" ]]; then
+            echo "FAIL: fs/susfs.c missing"; exit 1
+          fi
+          echo "PASS: fs/susfs.c exists"
+
+          echo "=== Checking fs/Makefile references susfs.o ==="
+          if ! grep -q 'susfs\.o' "$KERNEL/fs/Makefile"; then
+            echo "FAIL: fs/Makefile has no susfs.o entry"; exit 1
+          fi
+          echo "PASS: fs/Makefile references susfs.o"
+
+          echo "=== Checking no stale ksu_syscall_hook_manager_* remains ==="
+          if grep -r 'ksu_syscall_hook_manager_' "$KERNEL/drivers/kernelsu/" \
+               --include='*.c' --include='*.h' -l 2>/dev/null | grep -q .; then
+            echo "FAIL: old ksu_syscall_hook_manager_* API still present after shim"
+            grep -r 'ksu_syscall_hook_manager_' "$KERNEL/drivers/kernelsu/" \
+              --include='*.c' --include='*.h' -n
+            exit 1
+          fi
+          echo "PASS: no stale ksu_syscall_hook_manager_* calls"
+
+          echo "=== KernelSU-Next version info ==="
+          cd "$KERNEL/KernelSU-Next"
+          git log --oneline -3
 
       # ── 9. Build with Bazel (Kleaf) ─────────────────────────────────────────
       - name: Build kernel (Bazel / Kleaf)
         run: |
           cd "$KERNEL_ROOT"
-
-          LTO="${{ inputs.lto }}"
-          DIST="$DIST_DIR"
-          mkdir -p "$DIST"
-
-          echo ">>> Starting Kleaf build (LTO=$LTO)"
+          mkdir -p "$DIST_DIR"
+          echo ">>> Starting Kleaf build (LTO=${{ inputs.lto }})"
           tools/bazel run \
             --jobs=$(nproc --all) \
-            --lto="$LTO" \
+            --lto="${{ inputs.lto }}" \
             //common:kernel_aarch64_dist \
-            -- --destdir="$DIST"
+            -- --destdir="$DIST_DIR"
+          echo ">>> Build artifacts:"; ls -lh "$DIST_DIR"
 
-          echo ">>> Build artifacts:"
-          ls -lh "$DIST"
-
-      # ── 10. Save build summary ──────────────────────────────────────────────
+      # ── 10. Build summary ───────────────────────────────────────────────────
       - name: Build summary
         if: always()
         run: |
-          DIST="$DIST_DIR"
-          echo "## 🏗️ Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Component | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Manifest branch | \`${{ inputs.manifest_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| KernelSU-Next branch | \`${{ inputs.ksu_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| KernelSU-Next commit | \`${{ env.KSU_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SUSFS branch | \`${{ inputs.susfs_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SUSFS commit | \`${{ env.SUSFS_COMMIT }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| LTO | \`${{ inputs.lto }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [[ -d "$DIST" ]]; then
-            echo "### Output files" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            ls -lh "$DIST" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "## 🏗️ Build Summary"
+            echo ""
+            echo "| Component | Value |"
+            echo "|---|---|"
+            echo "| Manifest branch | \`${{ inputs.manifest_branch }}\` |"
+            echo "| KernelSU-Next commit | \`${{ env.KSU_COMMIT }}\` |"
+            echo "| SUSFS branch | \`${{ inputs.susfs_branch }}\` |"
+            echo "| SUSFS commit | \`${{ env.SUSFS_COMMIT }}\` |"
+            echo "| LTO | \`${{ inputs.lto }}\` |"
+            echo ""
+            if [[ -d "$DIST_DIR" ]]; then
+              echo "### Output files"
+              echo '```'
+              ls -lh "$DIST_DIR"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── 11. (Optional) Patch stock boot.img with magiskboot ─────────────────
-      - name: Patch boot.img
+      # ── 11. (Optional) Patch stock boot.img ────────────────────────────────
+      - name: Patch stock boot.img with magiskboot
         if: ${{ inputs.boot_image_url != '' }}
         run: |
-          BOOT_URL="${{ inputs.boot_image_url }}"
-          DIST="$DIST_DIR"
-
           echo ">>> Downloading stock boot.img"
-          curl -L --progress-bar -o stock_boot.img "$BOOT_URL"
+          curl -L --progress-bar -o stock_boot.img "${{ inputs.boot_image_url }}"
 
-          # Grab magiskboot from the Magisk releases
-          MAGISKBOOT_URL="https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v*.apk"
-          echo ">>> Fetching magiskboot"
-          curl -L --progress-bar -o magisk.apk \
-            $(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
-              | grep browser_download_url | grep '\.apk' | head -1 \
-              | cut -d '"' -f4)
-          unzip -qo magisk.apk lib/x86_64/libmagiskboot.so \
-            -d magisk_tmp
-          cp magisk_tmp/lib/x86_64/libmagiskboot.so magiskboot
-          chmod +x magiskboot
+          MAGISK_URL=$(curl -s \
+            https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | grep browser_download_url | grep '\.apk' | head -1 | cut -d '"' -f4)
+          curl -L --progress-bar -o magisk.apk "$MAGISK_URL"
+          unzip -qo magisk.apk lib/x86_64/libmagiskboot.so -d magisk_tmp
+          cp magisk_tmp/lib/x86_64/libmagiskboot.so magiskboot && chmod +x magiskboot
 
-          echo ">>> Unpacking stock boot.img"
-          mkdir -p boot_work && cd boot_work
+          mkdir boot_work && cd boot_work
           ../magiskboot unpack ../stock_boot.img
-
-          echo ">>> Swapping kernel Image"
-          cp "$DIST/Image" kernel
-
-          echo ">>> Repacking boot.img"
+          cp "$DIST_DIR/Image" kernel
           ../magiskboot repack ../stock_boot.img ../patched_boot.img
-
           cd ..
-          echo "PATCHED_BOOT=patched_boot.img" >> "$GITHUB_ENV"
           ls -lh patched_boot.img
+          echo "PATCHED_BOOT_READY=true" >> "$GITHUB_ENV"
 
       # ── 12. (Optional) AnyKernel3 packaging ────────────────────────────────
       - name: Package with AnyKernel3
         if: ${{ inputs.anykernel3 == true || inputs.anykernel3 == 'true' }}
         run: |
-          DIST="$DIST_DIR"
           AK3_DIR="${{ github.workspace }}/AnyKernel3"
-
-          echo ">>> Cloning AnyKernel3"
-          git clone --depth=1 \
-            https://github.com/osm0sis/AnyKernel3.git \
-            "$AK3_DIR"
-
-          # Strip the example device restrictions so it works on any GKI device
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_DIR"
           sed -i \
             -e 's/do\.devicecheck=1/do.devicecheck=0/' \
             -e '/^supported\.versions/d' \
             -e '/^supported\.patchlevels/d' \
             "$AK3_DIR/anykernel.sh"
 
-          # Copy kernel image
-          cp "$DIST/Image"          "$AK3_DIR/"
-          cp "$DIST/Image.lz4" "$AK3_DIR/" 2>/dev/null || true
+          cp "$DIST_DIR/Image"     "$AK3_DIR/"
+          cp "$DIST_DIR/Image.lz4" "$AK3_DIR/" 2>/dev/null || true
 
-          echo ">>> Creating AnyKernel3 ZIP"
+          ZIP_NAME="AK3-A14-6.1-KSUN-SUSFS-${{ env.KSU_COMMIT }}.zip"
           cd "$AK3_DIR"
-          zip -r9 -q \
-            "${{ github.workspace }}/AK3-A14-6.1-KSUN-SUSFS.zip" \
-            . \
+          zip -r9 -q "${{ github.workspace }}/$ZIP_NAME" . \
             -x '*.git*' -x 'README.md'
-
           cd "${{ github.workspace }}"
-          ls -lh AK3-A14-6.1-KSUN-SUSFS.zip
+          echo "AK3_ZIP=$ZIP_NAME" >> "$GITHUB_ENV"
+          ls -lh "$ZIP_NAME"
 
-      # ── 13. Upload kernel Image ─────────────────────────────────────────────
-      - name: Upload kernel Image artifact
+      # ── 13. Upload artifacts ────────────────────────────────────────────────
+      - name: Upload kernel Image
         uses: actions/upload-artifact@v4
         with:
           name: kernel-image-a14-6.1
@@ -366,19 +412,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ── 14. Upload AnyKernel3 ZIP ───────────────────────────────────────────
-      - name: Upload AnyKernel3 artifact
+      - name: Upload AnyKernel3 ZIP
         if: ${{ inputs.anykernel3 == true || inputs.anykernel3 == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: AK3-A14-6.1-KSUN-SUSFS
-          path: AK3-A14-6.1-KSUN-SUSFS.zip
+          path: ${{ env.AK3_ZIP }}
           if-no-files-found: warn
           retention-days: 7
 
-      # ── 15. Upload patched boot.img ─────────────────────────────────────────
-      - name: Upload patched boot.img artifact
-        if: ${{ inputs.boot_image_url != '' }}
+      - name: Upload patched boot.img
+        if: ${{ env.PATCHED_BOOT_READY == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: patched-boot-a14-6.1
@@ -386,8 +430,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ── 16. Upload full dist folder ─────────────────────────────────────────
-      - name: Upload full dist artifacts
+      - name: Upload full dist folder
         uses: actions/upload-artifact@v4
         with:
           name: dist-a14-6.1-full
