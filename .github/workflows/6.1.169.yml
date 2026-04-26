@@ -1,0 +1,396 @@
+name: Build GKI Kernel · Android 14 / 6.1 + KernelSU-Next + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "Kernel manifest branch"
+        type: string
+        default: "common-android14-6.1-2026-03"
+        required: true
+
+      ksu_branch:
+        description: "KernelSU-Next branch (next-susfs recommended)"
+        type: choice
+        options:
+          - next-susfs
+          - next-susfs-dev
+          - next
+        default: next-susfs
+
+      ksu_commit:
+        description: "Pin KernelSU-Next to a specific commit (optional, leave blank for HEAD)"
+        type: string
+        default: ""
+        required: false
+
+      susfs_branch:
+        description: "SUSFS branch"
+        type: string
+        default: "gki-android14-6.1"
+        required: true
+
+      lto:
+        description: "LTO mode"
+        type: choice
+        options:
+          - thin
+          - full
+          - none
+        default: thin
+
+      anykernel3:
+        description: "Package with AnyKernel3?"
+        type: boolean
+        default: true
+
+      boot_image_url:
+        description: "Stock boot.img URL for patching (optional, leave blank to skip)"
+        type: string
+        default: ""
+        required: false
+
+permissions:
+  contents: write
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+# ─────────────────────────────────────────────────────────────────────────────
+
+  build:
+    name: Build · android14-6.1
+    runs-on: ubuntu-latest
+
+    env:
+      KERNEL_ROOT: ${{ github.workspace }}/kernel
+      DIST_DIR:    ${{ github.workspace }}/kernel/out/dist
+      SUSFS_DIR:   ${{ github.workspace }}/susfs4ksu
+
+    steps:
+      # ── 0. Maximise disk space ──────────────────────────────────────────────
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android:          true
+          remove_dotnet:           true
+          remove_haskell:          true
+          remove_tool_cache:       true
+          remove_swap:             true
+          remove_packages: >
+            azure-cli google-cloud-cli microsoft-edge-stable
+            google-chrome-stable firefox postgresql* temurin-*
+            *llvm* mysql* dotnet-sdk-*
+          remove_packages_one_command: true
+          remove_folders: >
+            /usr/share/swift /usr/share/miniconda /usr/share/az*
+            /usr/local/lib/node_modules /usr/local/share/chromium
+            /usr/local/share/powershell /usr/local/julia
+            /usr/local/aws-cli /usr/local/aws-sam-cli
+            /usr/share/gradle
+          rm_cmd:      rmz
+          rmz_version: "3.1.1"
+          testing:     false
+
+      # ── 1. Install host dependencies ────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl \
+            flex git libelf-dev libncurses-dev libssl-dev lz4 \
+            python3 python3-pip repo unzip wget zip zstd \
+            ccache
+          # repo needs a modern Python
+          python3 -m pip install --upgrade --break-system-packages \
+            gitpython
+
+      # ── 2. Configure ccache ─────────────────────────────────────────────────
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: "4G"
+          key: gki-a14-6.1-${{ inputs.manifest_branch }}
+
+      # ── 3. Checkout this repo (for any local scripts) ───────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo-scripts
+
+      # ── 4. repo init + sync ─────────────────────────────────────────────────
+      - name: repo init
+        run: |
+          mkdir -p "$KERNEL_ROOT"
+          cd "$KERNEL_ROOT"
+          repo init \
+            --depth=1 \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${{ inputs.manifest_branch }}" \
+            --repo-rev=v2.16
+          echo "repo init complete for branch: ${{ inputs.manifest_branch }}"
+
+      - name: repo sync
+        run: |
+          cd "$KERNEL_ROOT"
+          repo sync \
+            -c \
+            --no-tags \
+            --no-clone-bundle \
+            -j$(nproc --all) \
+            --fail-fast
+          echo "Disk usage after sync:"
+          df -h .
+
+      # ── 5. Set up KernelSU-Next ─────────────────────────────────────────────
+      - name: Set up KernelSU-Next
+        run: |
+          cd "$KERNEL_ROOT/common"
+
+          KSU_BRANCH="${{ inputs.ksu_branch }}"
+          KSU_COMMIT="${{ inputs.ksu_commit }}"
+
+          echo ">>> Injecting KernelSU-Next (branch: $KSU_BRANCH)"
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/$KSU_BRANCH/kernel/setup.sh" \
+            | bash -s "$KSU_BRANCH"
+
+          # Optionally pin to a specific commit
+          if [[ -n "$KSU_COMMIT" ]]; then
+            echo ">>> Pinning KernelSU-Next to commit: $KSU_COMMIT"
+            cd KernelSU-Next
+            git fetch --depth=1 origin "$KSU_COMMIT"
+            git checkout "$KSU_COMMIT"
+            cd ..
+          fi
+
+          KSU_VER=$(cd KernelSU-Next && git rev-parse --short HEAD)
+          echo "KSU_VERSION=$KSU_VER" >> "$GITHUB_ENV"
+          echo "KernelSU-Next version: $KSU_VER"
+
+      # ── 6. Clone SUSFS ──────────────────────────────────────────────────────
+      - name: Clone SUSFS
+        run: |
+          git clone \
+            --depth=1 \
+            -b "${{ inputs.susfs_branch }}" \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            "$SUSFS_DIR"
+
+          SUSFS_COMMIT=$(cd "$SUSFS_DIR" && git rev-parse --short HEAD)
+          echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
+          echo "SUSFS commit: $SUSFS_COMMIT"
+
+      # ── 7. Apply SUSFS patches ──────────────────────────────────────────────
+      - name: Apply SUSFS kernel patches
+        run: |
+          BRANCH="${{ inputs.susfs_branch }}"
+          PATCHES_DIR="$SUSFS_DIR/kernel_patches"
+
+          cd "$KERNEL_ROOT/common"
+
+          echo ">>> Applying SUSFS kernel patch (50_add_susfs_in_${BRANCH}.patch)"
+          PATCH_FILE="$PATCHES_DIR/50_add_susfs_in_${BRANCH}.patch"
+
+          if [[ ! -f "$PATCH_FILE" ]]; then
+            # Try wildcard match in case name has extra suffix
+            PATCH_FILE=$(ls "$PATCHES_DIR"/50_add_susfs_in_${BRANCH}*.patch 2>/dev/null | head -1)
+          fi
+
+          if [[ -z "$PATCH_FILE" || ! -f "$PATCH_FILE" ]]; then
+            echo "ERROR: Could not find SUSFS kernel patch for branch $BRANCH"
+            ls "$PATCHES_DIR"/
+            exit 1
+          fi
+
+          patch -p1 --forward --no-backup-if-mismatch < "$PATCH_FILE" || {
+            echo "WARNING: SUSFS kernel patch had rejects — check .rej files"
+            find . -name "*.rej" | head -20
+          }
+
+          # Apply KernelSU-Next SUSFS enablement patch
+          # (Only needed when using 'next' branch; 'next-susfs' already has it)
+          KSU_BRANCH="${{ inputs.ksu_branch }}"
+          if [[ "$KSU_BRANCH" == "next" ]]; then
+            echo ">>> Applying SUSFS → KernelSU-Next enablement patch"
+            KSU_PATCH="$PATCHES_DIR/KernelSU/10_enable_susfs_for_ksu.patch"
+            if [[ -f "$KSU_PATCH" ]]; then
+              cd KernelSU-Next
+              patch -p1 --forward --no-backup-if-mismatch < "$KSU_PATCH" || \
+                echo "WARNING: KSU enablement patch had rejects"
+              cd ..
+            else
+              echo "WARNING: KSU enablement patch not found at $KSU_PATCH"
+            fi
+          else
+            echo ">>> Skipping KSU enablement patch (already in $KSU_BRANCH branch)"
+          fi
+
+          # Copy SUSFS source files into kernel tree
+          echo ">>> Copying SUSFS fs/ sources into kernel"
+          cp -v "$SUSFS_DIR/kernel_patches/fs/"*.c fs/ 2>/dev/null || true
+          cp -v "$SUSFS_DIR/kernel_patches/include/linux/"*.h \
+            include/linux/ 2>/dev/null || true
+
+      # ── 8. (Optional) Apply additional scope-minimised manual hooks ─────────
+      - name: Apply manual hooks patch (if present)
+        run: |
+          HOOKS_PATCH="$SUSFS_DIR/kernel_patches/60_scope-minimized_manual_hooks.patch"
+          if [[ -f "$HOOKS_PATCH" ]]; then
+            echo ">>> Applying scope-minimised manual hooks patch"
+            cd "$KERNEL_ROOT/common"
+            patch -p1 --forward --no-backup-if-mismatch < "$HOOKS_PATCH" || \
+              echo "WARNING: hooks patch had rejects"
+          else
+            echo ">>> No manual hooks patch found, skipping"
+          fi
+
+      # ── 9. Build with Bazel (Kleaf) ─────────────────────────────────────────
+      - name: Build kernel (Bazel / Kleaf)
+        run: |
+          cd "$KERNEL_ROOT"
+
+          LTO="${{ inputs.lto }}"
+          DIST="$DIST_DIR"
+          mkdir -p "$DIST"
+
+          echo ">>> Starting Kleaf build (LTO=$LTO)"
+          tools/bazel run \
+            --jobs=$(nproc --all) \
+            --lto="$LTO" \
+            //common:kernel_aarch64_dist \
+            -- --destdir="$DIST"
+
+          echo ">>> Build artifacts:"
+          ls -lh "$DIST"
+
+      # ── 10. Save build summary ──────────────────────────────────────────────
+      - name: Build summary
+        if: always()
+        run: |
+          DIST="$DIST_DIR"
+          echo "## 🏗️ Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Manifest branch | \`${{ inputs.manifest_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| KernelSU-Next branch | \`${{ inputs.ksu_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| KernelSU-Next commit | \`${{ env.KSU_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SUSFS branch | \`${{ inputs.susfs_branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SUSFS commit | \`${{ env.SUSFS_COMMIT }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| LTO | \`${{ inputs.lto }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -d "$DIST" ]]; then
+            echo "### Output files" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            ls -lh "$DIST" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── 11. (Optional) Patch stock boot.img with magiskboot ─────────────────
+      - name: Patch boot.img
+        if: ${{ inputs.boot_image_url != '' }}
+        run: |
+          BOOT_URL="${{ inputs.boot_image_url }}"
+          DIST="$DIST_DIR"
+
+          echo ">>> Downloading stock boot.img"
+          curl -L --progress-bar -o stock_boot.img "$BOOT_URL"
+
+          # Grab magiskboot from the Magisk releases
+          MAGISKBOOT_URL="https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v*.apk"
+          echo ">>> Fetching magiskboot"
+          curl -L --progress-bar -o magisk.apk \
+            $(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+              | grep browser_download_url | grep '\.apk' | head -1 \
+              | cut -d '"' -f4)
+          unzip -qo magisk.apk lib/x86_64/libmagiskboot.so \
+            -d magisk_tmp
+          cp magisk_tmp/lib/x86_64/libmagiskboot.so magiskboot
+          chmod +x magiskboot
+
+          echo ">>> Unpacking stock boot.img"
+          mkdir -p boot_work && cd boot_work
+          ../magiskboot unpack ../stock_boot.img
+
+          echo ">>> Swapping kernel Image"
+          cp "$DIST/Image" kernel
+
+          echo ">>> Repacking boot.img"
+          ../magiskboot repack ../stock_boot.img ../patched_boot.img
+
+          cd ..
+          echo "PATCHED_BOOT=patched_boot.img" >> "$GITHUB_ENV"
+          ls -lh patched_boot.img
+
+      # ── 12. (Optional) AnyKernel3 packaging ────────────────────────────────
+      - name: Package with AnyKernel3
+        if: ${{ inputs.anykernel3 == true || inputs.anykernel3 == 'true' }}
+        run: |
+          DIST="$DIST_DIR"
+          AK3_DIR="${{ github.workspace }}/AnyKernel3"
+
+          echo ">>> Cloning AnyKernel3"
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git \
+            "$AK3_DIR"
+
+          # Strip the example device restrictions so it works on any GKI device
+          sed -i \
+            -e 's/do\.devicecheck=1/do.devicecheck=0/' \
+            -e '/^supported\.versions/d' \
+            -e '/^supported\.patchlevels/d' \
+            "$AK3_DIR/anykernel.sh"
+
+          # Copy kernel image
+          cp "$DIST/Image"          "$AK3_DIR/"
+          cp "$DIST/Image.lz4" "$AK3_DIR/" 2>/dev/null || true
+
+          echo ">>> Creating AnyKernel3 ZIP"
+          cd "$AK3_DIR"
+          zip -r9 -q \
+            "${{ github.workspace }}/AK3-A14-6.1-KSUN-SUSFS.zip" \
+            . \
+            -x '*.git*' -x 'README.md'
+
+          cd "${{ github.workspace }}"
+          ls -lh AK3-A14-6.1-KSUN-SUSFS.zip
+
+      # ── 13. Upload kernel Image ─────────────────────────────────────────────
+      - name: Upload kernel Image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image-a14-6.1
+          path: |
+            ${{ env.DIST_DIR }}/Image
+            ${{ env.DIST_DIR }}/Image.lz4
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ── 14. Upload AnyKernel3 ZIP ───────────────────────────────────────────
+      - name: Upload AnyKernel3 artifact
+        if: ${{ inputs.anykernel3 == true || inputs.anykernel3 == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AK3-A14-6.1-KSUN-SUSFS
+          path: AK3-A14-6.1-KSUN-SUSFS.zip
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ── 15. Upload patched boot.img ─────────────────────────────────────────
+      - name: Upload patched boot.img artifact
+        if: ${{ inputs.boot_image_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-boot-a14-6.1
+          path: patched_boot.img
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ── 16. Upload full dist folder ─────────────────────────────────────────
+      - name: Upload full dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-a14-6.1-full
+          path: ${{ env.DIST_DIR }}/
+          if-no-files-found: warn
+          retention-days: 3
